@@ -1,4 +1,11 @@
+const http = require('http');
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+
+// Dummy HTTP server to keep Render Web Service active
+http.createServer((req, res) => {
+    res.write("PHOTOCOPIA BOT is running!");
+    res.end();
+}).listen(process.env.PORT || 3000);
 
 const client = new Client({
     intents: [
@@ -10,7 +17,7 @@ const client = new Client({
 });
 
 client.on('ready', () => {
-    console.log(`Bot is active as ${client.user.tag}!`);
+    console.log(`Logged in as ${client.user.tag}!`);
 });
 
 // Run !setup-roles in your #pick-your-roles channel
@@ -49,12 +56,12 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// Map Button Custom IDs to your Discord Server Role IDs
+// Map Button Custom IDs to your actual Discord Server Role IDs
 const ROLE_MAP = {
-    'role_dslr': '1410191834125865031',
-    'role_featured': '1410192080398880819',
-    'role_mobile': '1410191924550738012',
-    'role_film': '1410191993240850555'
+    'role_dslr': '1547618209664999475',
+    'role_featured': '1547617975778025562',
+    'role_mobile': '1547618680077291571',
+    'role_film': '1547618880229351535'
 };
 
 client.on('interactionCreate', async (interaction) => {
