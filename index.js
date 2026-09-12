@@ -84,4 +84,4 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
-client.login('MTU0ODM0Mzc0MjI1NDE1Nzg5Ng.GZ1xY2.YOUR_FULL_TOKEN_HERE');
+client.login('MTU0ODM0Mzc0MjI1NDE1Nzg5Ng.GkplBD.H8spRyjPl8bNRxMybUUTf1mxa8UeslzcjrHvL4');
