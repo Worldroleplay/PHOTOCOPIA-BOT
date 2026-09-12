@@ -1,0 +1,929 @@
+"""
+Photocopia XP Bot
+-----------------
+A discord.py 2.x XP system for the Photocopia art/photography server.
+
+Rules:
+- Image post in a photography channel: +10 Photography XP.
+- Image post in an artist channel: +10 Artist XP.
+- Every reaction currently on an image post: +1 XP to the post author.
+- Removing a reaction removes 1 XP.
+- Bot reactions are ignored.
+- Deleted tracked posts have their XP removed.
+- Only Photography and Artist categories are implemented.
+
+The role thresholds below follow the table in the supplied PDF:
+5 / 10 / 20 / 30 / 50 XP.
+"""
+
+import json
+import os
+import asyncio
+from pathlib import Path
+from typing import Optional
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+TOKEN = os.getenv("DISCORD_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+DATA_FILE = Path("photocopia_xp.json")
+
+IMAGE_XP = 10
+REACTION_XP = 1
+
+# The supplied PDF's example thresholds:
+PHOTOGRAPHY_LEVELS = [
+    (1, "Amateur Photographer", 5),
+    (2, "Keen Photographer", 10),
+    (3, "Expert Photographer", 20),
+    (4, "Master Photographer", 30),
+    (5, "Legendary Photographer", 50),
+]
+
+ARTIST_LEVELS = [
+    (1, "Amateur Artist", 5),
+    (2, "Keen Artist", 10),
+    (3, "Expert Artist", 20),
+    (4, "Master Artist", 30),
+    (5, "Legendary Artist", 50),
+]
+
+# Photography channels supplied by you.
+PHOTOGRAPHY_CHANNEL_IDS = {
+    1548228580880809995,  # Professional Photography
+    1548229371007868959,  # Daily Life Photography
+    1548229516886020117,  # NSFW Photography
+}
+
+# Artist channels supplied by you.
+ARTIST_CHANNEL_IDS = {
+    1548229673841074196,
+    1548229832419049502,
+    1548230011163779244,
+    1548230107456475167,
+    1548230231456874547,
+}
+
+ALL_XP_CHANNEL_IDS = PHOTOGRAPHY_CHANNEL_IDS | ARTIST_CHANNEL_IDS
+
+# ============================================================
+# INTENTS
+# ============================================================
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = True
+intents.reactions = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+data = {
+    "users": {},
+    "posts": {},
+}
+
+
+def load_data():
+    global data
+
+    if not DATA_FILE.exists():
+        data = {"users": {}, "posts": {}}
+        return
+
+    try:
+        with DATA_FILE.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+
+        if not isinstance(loaded, dict):
+            raise ValueError("Database root is not an object.")
+
+        data = {
+            "users": loaded.get("users", {}),
+            "posts": loaded.get("posts", {}),
+        }
+
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(f"[DATABASE] Could not load database: {e}")
+        print("[DATABASE] Starting with a fresh database.")
+        data = {"users": {}, "posts": {}}
+
+
+def save_data():
+    # Atomic-ish save: write a temporary file first, then replace.
+    temp_file = DATA_FILE.with_suffix(".tmp")
+
+    with temp_file.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    temp_file.replace(DATA_FILE)
+
+
+def get_user(user_id: int) -> dict:
+    uid = str(user_id)
+
+    if uid not in data["users"]:
+        data["users"][uid] = {
+            "photography_xp": 0,
+            "artist_xp": 0,
+        }
+
+    # Protect against older/incomplete database versions.
+    data["users"][uid].setdefault("photography_xp", 0)
+    data["users"][uid].setdefault("artist_xp", 0)
+
+    return data["users"][uid]
+
+
+def change_xp(user_id: int, category: str, amount: int):
+    user = get_user(user_id)
+
+    if category == "photography":
+        user["photography_xp"] = max(0, user["photography_xp"] + amount)
+    elif category == "artist":
+        user["artist_xp"] = max(0, user["artist_xp"] + amount)
+    else:
+        raise ValueError(f"Unknown XP category: {category}")
+
+
+# ============================================================
+# LEVEL / ROLE HELPERS
+# ============================================================
+
+def get_level(xp: int, levels: list[tuple[int, str, int]]) -> int:
+    current_level = 0
+
+    for level, _, required_xp in levels:
+        if xp >= required_xp:
+            current_level = level
+        else:
+            break
+
+    return current_level
+
+
+def get_level_info(xp: int, levels: list[tuple[int, str, int]]):
+    current = None
+    next_level = None
+
+    for level, title, required_xp in levels:
+        if xp >= required_xp:
+            current = (level, title, required_xp)
+        elif next_level is None:
+            next_level = (level, title, required_xp)
+
+    return current, next_level
+
+
+def category_from_channel(channel_id: int) -> Optional[str]:
+    if channel_id in PHOTOGRAPHY_CHANNEL_IDS:
+        return "photography"
+
+    if channel_id in ARTIST_CHANNEL_IDS:
+        return "artist"
+
+    return None
+
+
+def is_image_message(message: discord.Message) -> bool:
+    """
+    Returns True when the message contains at least one image attachment.
+
+    Discord normally provides attachment.content_type, but the filename
+    fallback also handles cases where content_type is missing.
+    """
+    for attachment in message.attachments:
+        content_type = (attachment.content_type or "").lower()
+        filename = attachment.filename.lower()
+
+        if content_type.startswith("image/"):
+            return True
+
+        if filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif")):
+            return True
+
+    return False
+
+
+# ============================================================
+# ROLE MANAGEMENT
+# ============================================================
+
+async def get_or_create_role(
+    guild: discord.Guild,
+    role_name: str,
+) -> discord.Role:
+    role = discord.utils.get(guild.roles, name=role_name)
+
+    if role is not None:
+        return role
+
+    try:
+        role = await guild.create_role(
+            name=role_name,
+            reason="Photocopia XP system",
+        )
+        print(f"[ROLES] Created role: {role_name}")
+        return role
+
+    except discord.Forbidden:
+        raise RuntimeError(
+            "I do not have permission to create roles. "
+            "Give the bot Manage Roles permission."
+        )
+
+
+async def ensure_category_roles(guild: discord.Guild, category: str):
+    levels = (
+        PHOTOGRAPHY_LEVELS
+        if category == "photography"
+        else ARTIST_LEVELS
+    )
+
+    for _, role_name, _ in levels:
+        await get_or_create_role(guild, role_name)
+
+
+async def update_category_roles(
+    member: discord.Member,
+    category: str,
+):
+    if category == "photography":
+        xp = get_user(member.id)["photography_xp"]
+        levels = PHOTOGRAPHY_LEVELS
+    else:
+        xp = get_user(member.id)["artist_xp"]
+        levels = ARTIST_LEVELS
+
+    current_level = get_level(xp, levels)
+
+    category_roles = []
+
+    for level, role_name, _ in levels:
+        role = discord.utils.get(member.guild.roles, name=role_name)
+
+        if role is not None:
+            category_roles.append((level, role))
+
+    # Remove all XP roles in this category first.
+    roles_to_remove = [
+        role for _, role in category_roles
+        if role in member.roles
+    ]
+
+    if roles_to_remove:
+        try:
+            await member.remove_roles(
+                *roles_to_remove,
+                reason="Photocopia XP level update",
+            )
+        except discord.Forbidden:
+            print(
+                f"[ROLES] Cannot remove roles from {member}."
+            )
+
+    # Add the highest role the user qualifies for.
+    if current_level > 0:
+        target_role = next(
+            (role for level, role in category_roles if level == current_level),
+            None,
+        )
+
+        if target_role is not None:
+            try:
+                await member.add_roles(
+                    target_role,
+                    reason="Photocopia XP level update",
+                )
+            except discord.Forbidden:
+                print(
+                    f"[ROLES] Cannot add role {target_role.name} "
+                    f"to {member}."
+                )
+
+
+async def update_all_roles(member: discord.Member):
+    await ensure_category_roles(member.guild, "photography")
+    await ensure_category_roles(member.guild, "artist")
+
+    await update_category_roles(member, "photography")
+    await update_category_roles(member, "artist")
+
+
+# ============================================================
+# XP EVENT HELPERS
+# ============================================================
+
+async def award_post_xp(message: discord.Message):
+    category = category_from_channel(message.channel.id)
+
+    if category is None:
+        return
+
+    if message.author.bot:
+        return
+
+    if not is_image_message(message):
+        return
+
+    message_id = str(message.id)
+
+    # Prevent duplicate XP if Discord/reconnect causes the event
+    # to be processed more than once.
+    if message_id in data["posts"]:
+        return
+
+    # Count reactions that already exist on the message.
+    reaction_counts = {
+        str(reaction.emoji): reaction.count
+        for reaction in message.reactions
+    }
+    existing_reactions = sum(reaction_counts.values())
+
+    data["posts"][message_id] = {
+        "author_id": message.author.id,
+        "channel_id": message.channel.id,
+        "category": category,
+        "post_xp": IMAGE_XP,
+        "reaction_count": existing_reactions,
+        "reactions": reaction_counts,
+    }
+
+    change_xp(
+        message.author.id,
+        category,
+        IMAGE_XP + (existing_reactions * REACTION_XP),
+    )
+
+    save_data()
+
+    if isinstance(message.author, discord.Member):
+        await update_category_roles(message.author, category)
+
+    print(
+        f"[XP] {message.author} +{IMAGE_XP} {category} XP "
+        f"for image {message.id}"
+    )
+
+
+async def remove_post_xp(message_id: int):
+    key = str(message_id)
+    post = data["posts"].pop(key, None)
+
+    if post is None:
+        return
+
+    category = post["category"]
+    author_id = int(post["author_id"])
+
+    total = post.get("post_xp", IMAGE_XP)
+    total += post.get("reaction_count", 0) * REACTION_XP
+
+    change_xp(author_id, category, -total)
+    save_data()
+
+    print(
+        f"[XP] Removed {total} {category} XP from deleted "
+        f"post {message_id}"
+    )
+
+
+# ============================================================
+# DISCORD EVENTS
+# ============================================================
+
+@bot.event
+async def on_ready():
+    print("=" * 50)
+    print(f"Logged in as {bot.user} ({bot.user.id})")
+    print(f"Connected to {len(bot.guilds)} server(s).")
+    print("=" * 50)
+
+    # Sync slash commands.
+    try:
+        synced = await bot.tree.sync()
+        print(f"[COMMANDS] Synced {len(synced)} slash commands.")
+    except Exception as e:
+        print(f"[COMMANDS] Sync failed: {e}")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    await award_post_xp(message)
+
+    # Keep prefix commands working too.
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None:
+        return
+
+    if bot.user and payload.user_id == bot.user.id:
+        return
+
+    post = data["posts"].get(str(payload.message_id))
+
+    if post is None:
+        return
+
+    # Every reaction added to a tracked image gives +1 XP.
+    category = post["category"]
+    author_id = int(post["author_id"])
+
+    reactions = post.setdefault("reactions", {})
+    emoji_key = str(payload.emoji)
+    reactions[emoji_key] = reactions.get(emoji_key, 0) + 1
+    post["reaction_count"] = post.get("reaction_count", 0) + 1
+
+    change_xp(author_id, category, REACTION_XP)
+    save_data()
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is not None:
+        member = guild.get_member(author_id)
+
+        if member is not None:
+            await update_category_roles(member, category)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None:
+        return
+
+    if bot.user and payload.user_id == bot.user.id:
+        return
+
+    post = data["posts"].get(str(payload.message_id))
+
+    if post is None:
+        return
+
+    if post.get("reaction_count", 0) <= 0:
+        return
+
+    category = post["category"]
+    author_id = int(post["author_id"])
+
+    reactions = post.setdefault("reactions", {})
+    emoji_key = str(payload.emoji)
+
+    if reactions.get(emoji_key, 0) > 0:
+        reactions[emoji_key] -= 1
+        if reactions[emoji_key] <= 0:
+            reactions.pop(emoji_key, None)
+
+    post["reaction_count"] -= 1
+    change_xp(author_id, category, -REACTION_XP)
+    save_data()
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is not None:
+        member = guild.get_member(author_id)
+
+        if member is not None:
+            await update_category_roles(member, category)
+
+
+@bot.event
+async def on_raw_reaction_clear(payload: discord.RawReactionClearEvent):
+    if payload.guild_id is None:
+        return
+
+    key = str(payload.message_id)
+    post = data["posts"].get(key)
+
+    if post is None:
+        return
+
+    old_count = post.get("reaction_count", 0)
+
+    if old_count <= 0:
+        return
+
+    post["reaction_count"] = 0
+
+    category = post["category"]
+    author_id = int(post["author_id"])
+
+    change_xp(
+        author_id,
+        category,
+        -(old_count * REACTION_XP),
+    )
+
+    save_data()
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is not None:
+        member = guild.get_member(author_id)
+
+        if member is not None:
+            await update_category_roles(member, category)
+
+
+@bot.event
+async def on_raw_reaction_clear_emoji(
+    payload: discord.RawReactionClearEmojiEvent
+):
+    """
+    Discord does not provide the number of reactions removed in this event.
+    We keep per-emoji counts so the bot can subtract the exact amount.
+    """
+    if payload.guild_id is None:
+        return
+
+    key = str(payload.message_id)
+    post = data["posts"].get(key)
+
+    if post is None:
+        return
+
+    reactions = post.setdefault("reactions", {})
+    emoji_key = str(payload.emoji)
+    removed_count = reactions.pop(emoji_key, 0)
+
+    if removed_count <= 0:
+        return
+
+    post["reaction_count"] = max(
+        0,
+        post.get("reaction_count", 0) - removed_count,
+    )
+
+    category = post["category"]
+    author_id = int(post["author_id"])
+
+    change_xp(
+        author_id,
+        category,
+        -(removed_count * REACTION_XP),
+    )
+
+    save_data()
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is not None:
+        member = guild.get_member(author_id)
+
+        if member is not None:
+            await update_category_roles(member, category)
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if payload.guild_id is None:
+        return
+
+    await remove_post_xp(payload.message_id)
+
+
+# ============================================================
+# SLASH COMMANDS
+# ============================================================
+
+@bot.tree.command(name="xp", description="Show your Photography and Artist XP.")
+@app_commands.describe(member="The member whose XP you want to view.")
+async def xp_command(
+    interaction: discord.Interaction,
+    member: Optional[discord.Member] = None,
+):
+    member = member or interaction.user
+
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "I couldn't resolve that member.",
+            ephemeral=True,
+        )
+        return
+
+    user = get_user(member.id)
+
+    photography_xp = user["photography_xp"]
+    artist_xp = user["artist_xp"]
+
+    photography_current, photography_next = get_level_info(
+        photography_xp,
+        PHOTOGRAPHY_LEVELS,
+    )
+
+    artist_current, artist_next = get_level_info(
+        artist_xp,
+        ARTIST_LEVELS,
+    )
+
+    embed = discord.Embed(
+        title=f"📊 {member.display_name}'s XP",
+        description="Photocopia Creator Progress",
+    )
+
+    if photography_current:
+        photo_level = photography_current[0]
+        photo_title = photography_current[1]
+    else:
+        photo_level = 0
+        photo_title = "No Photographer Level Yet"
+
+    if artist_current:
+        artist_level = artist_current[0]
+        artist_title = artist_current[1]
+    else:
+        artist_level = 0
+        artist_title = "No Artist Level Yet"
+
+    embed.add_field(
+        name="📷 Photographer",
+        value=(
+            f"**{photography_xp} XP**\n"
+            f"Level **{photo_level}** — {photo_title}"
+        ),
+        inline=False,
+    )
+
+    if photography_next:
+        embed.add_field(
+            name="Next Photography Level",
+            value=(
+                f"Level {photography_next[0]} — "
+                f"{photography_next[1]} "
+                f"at **{photography_next[2]} XP**"
+            ),
+            inline=False,
+        )
+
+    embed.add_field(
+        name="🎨 Artist",
+        value=(
+            f"**{artist_xp} XP**\n"
+            f"Level **{artist_level}** — {artist_title}"
+        ),
+        inline=False,
+    )
+
+    if artist_next:
+        embed.add_field(
+            name="Next Artist Level",
+            value=(
+                f"Level {artist_next[0]} — "
+                f"{artist_next[1]} "
+                f"at **{artist_next[2]} XP**"
+            ),
+            inline=False,
+        )
+
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="leaderboard",
+    description="Show the Photography or Artist XP leaderboard.",
+)
+@app_commands.describe(category="Choose which XP leaderboard to show.")
+@app_commands.choices(
+    category=[
+        app_commands.Choice(name="Photography", value="photography"),
+        app_commands.Choice(name="Artist", value="artist"),
+    ]
+)
+async def leaderboard_command(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str],
+):
+    category_name = category.value
+
+    if category_name == "photography":
+        xp_key = "photography_xp"
+        title = "📷 Photography Leaderboard"
+    else:
+        xp_key = "artist_xp"
+        title = "🎨 Artist Leaderboard"
+
+    entries = []
+
+    for user_id, user_data in data["users"].items():
+        xp = user_data.get(xp_key, 0)
+
+        if xp <= 0:
+            continue
+
+        entries.append((int(user_id), xp))
+
+    entries.sort(key=lambda item: item[1], reverse=True)
+    entries = entries[:10]
+
+    lines = []
+
+    for position, (user_id, xp) in enumerate(entries, start=1):
+        member = interaction.guild.get_member(user_id)
+
+        if member is not None:
+            name = member.display_name
+        else:
+            name = f"User {user_id}"
+
+        lines.append(
+            f"**{position}.** {name} — **{xp} XP**"
+        )
+
+    if not lines:
+        lines.append("No XP has been earned yet.")
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines),
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="sync_xp",
+    description="Rebuild XP from image posts in the configured channels.",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def sync_xp_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    # Rebuild everything from scratch.
+    data["users"] = {}
+    data["posts"] = {}
+
+    scanned = 0
+    images = 0
+
+    for channel_id in ALL_XP_CHANNEL_IDS:
+        channel = interaction.guild.get_channel(channel_id)
+
+        if channel is None:
+            print(f"[SYNC] Could not find channel {channel_id}")
+            continue
+
+        if not isinstance(channel, discord.TextChannel):
+            continue
+
+        print(f"[SYNC] Scanning #{channel.name} ({channel.id})")
+
+        try:
+            async for message in channel.history(limit=None):
+                scanned += 1
+
+                if message.author.bot:
+                    continue
+
+                if not is_image_message(message):
+                    continue
+
+                category = category_from_channel(channel.id)
+
+                if category is None:
+                    continue
+
+                reaction_counts = {
+                    str(reaction.emoji): reaction.count
+                    for reaction in message.reactions
+                }
+                reaction_count = sum(reaction_counts.values())
+
+                data["posts"][str(message.id)] = {
+                    "author_id": message.author.id,
+                    "channel_id": channel.id,
+                    "category": category,
+                    "post_xp": IMAGE_XP,
+                    "reaction_count": reaction_count,
+                    "reactions": reaction_counts,
+                }
+
+                change_xp(
+                    message.author.id,
+                    category,
+                    IMAGE_XP + reaction_count * REACTION_XP,
+                )
+
+                images += 1
+
+        except discord.Forbidden:
+            print(
+                f"[SYNC] No permission to read history in #{channel.name}"
+            )
+
+    save_data()
+
+    # Update roles for every member with XP.
+    for user_id in data["users"]:
+        member = interaction.guild.get_member(int(user_id))
+
+        if member is not None:
+            await update_all_roles(member)
+
+    await interaction.followup.send(
+        f"✅ XP sync complete.\n"
+        f"Messages scanned: **{scanned}**\n"
+        f"Image posts counted: **{images}**",
+        ephemeral=True,
+    )
+
+
+@sync_xp_command.error
+async def sync_xp_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need **Manage Server** permission to use this command."
+    else:
+        message = f"Sync failed: `{error}`"
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+# ============================================================
+# OPTIONAL ADMIN PREFIX COMMAND
+# ============================================================
+
+@bot.command(name="setxp")
+@commands.has_permissions(manage_guild=True)
+async def setxp(
+    ctx: commands.Context,
+    member: discord.Member,
+    category: str,
+    amount: int,
+):
+    """
+    Example:
+    !setxp @User photography 100
+    !setxp @User artist 50
+    """
+    category = category.lower()
+
+    if category not in ("photography", "artist"):
+        await ctx.send(
+            "Category must be `photography` or `artist`."
+        )
+        return
+
+    user = get_user(member.id)
+
+    if category == "photography":
+        user["photography_xp"] = max(0, amount)
+    else:
+        user["artist_xp"] = max(0, amount)
+
+    save_data()
+    await update_category_roles(member, category)
+
+    await ctx.send(
+        f"Set {member.mention}'s {category} XP to **{amount}**."
+    )
+
+
+@setxp.error
+async def setxp_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need **Manage Server** permission.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(
+            "Usage: `!setxp @User photography 100`"
+        )
+
+
+# ============================================================
+# START
+# ============================================================
+
+if TOKEN == "PUT_YOUR_BOT_TOKEN_HERE" or not TOKEN:
+    raise RuntimeError(
+        "Set your bot token in the DISCORD_TOKEN environment variable "
+        "or replace PUT_YOUR_BOT_TOKEN_HERE in the code."
+    )
+
+load_data()
+
+bot.run(TOKEN)
