@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://worldroleplay.github.io/wrp-website/sitemap.xml
