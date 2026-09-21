@@ -195,7 +195,7 @@ client.on('interactionCreate', async (interaction) => {
 
                 const winnerEmbed = new EmbedBuilder()
                     .setTitle('🏆 Photo of the Week (POTW) Winner!')
-                    .setDescription(`Voting has officially closed! The community has spoken, and the winner is **${winnerFormatted}** with a total of **${maxVotes}** secure votes! 🎉\n\nCheck out `#photo-of-the-week` to view the winning shot.`)
+                    .setDescription(`Voting has officially closed! The community has spoken, and the winner is **${winnerFormatted}** with a total of **${maxVotes}** secure votes! 🎉\n\nCheck out "#photo-of-the-week" to view the winning shot.`)
                     .setColor('#00FF00')
                     .setTimestamp();
 
