@@ -1,5 +1,17 @@
 const http = require('http');
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+const { 
+    Client, 
+    GatewayIntentBits, 
+    ActionRowBuilder, 
+    ButtonBuilder, 
+    ButtonStyle, 
+    EmbedBuilder,
+    REST,
+    Routes,
+    SlashCommandBuilder,
+    StringSelectMenuBuilder,
+    PermissionsBitField
+} = require('discord.js');
 
 // Dummy HTTP server to keep Render Web Service active
 http.createServer((req, res) => {
@@ -16,8 +28,39 @@ const client = new Client({
     ]
 });
 
-client.on('ready', () => {
+// Store POTW votes in memory: { [messageId]: { [userId]: selectedOption } }
+const activeVotes = new Map();
+
+client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
+
+    // Register the /vote command globally
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('vote')
+            .setDescription('Start a POTW voting session')
+            .addStringOption(option =>
+                option.setName('type')
+                    .setDescription('Type of vote')
+                    .setRequired(true)
+                    .addChoices(
+                        { name: 'POTW', value: 'POTW' }
+                    )
+            )
+    ];
+
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+    try {
+        console.log('Started refreshing application (/) commands.');
+        await rest.put(
+            Routes.applicationCommands(client.user.id),
+            { body: commands },
+        );
+        console.log('Successfully reloaded application (/) commands.');
+    } catch (error) {
+        console.error(error);
+    }
 });
 
 // Run !setup-roles in your #pick-your-roles channel
@@ -65,29 +108,114 @@ const ROLE_MAP = {
 };
 
 client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
-
-    const roleId = ROLE_MAP[interaction.customId];
-    if (!roleId) return;
-
-    const role = interaction.guild.roles.cache.get(roleId);
-    if (!role) {
-        return interaction.reply({ content: 'Role ID not found. Please check your config.', ephemeral: true });
-    }
-
-    const member = interaction.member;
-
     try {
-        if (member.roles.cache.has(roleId)) {
-            await member.roles.remove(roleId);
-            await interaction.reply({ content: `Removed **${role.name}** role!`, ephemeral: true });
-        } else {
-            await member.roles.add(roleId);
-            await interaction.reply({ content: `Granted **${role.name}** role! You can now send messages in your dedicated channel.`, ephemeral: true });
+        // 1. Handle Slash Commands (e.g., /vote POTW)
+        if (interaction.isChatInputCommand()) {
+            if (interaction.commandName === 'vote') {
+                const voteType = interaction.options.getString('type');
+
+                if (voteType === 'POTW') {
+                    // Check if user has Founder, Owner, Co-Owner or Admin permissions
+                    const allowedRoles = ['founder', 'owner', 'co-owner'];
+                    const hasAllowedRole = interaction.member.roles.cache.some(role => 
+                        allowedRoles.some(name => role.name.toLowerCase().includes(name))
+                    );
+                    const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+                    if (!hasAllowedRole && !isAdmin) {
+                        return interaction.reply({ 
+                            content: '❌ You do not have permission to start a POTW vote! Only Founders, Owners, and Co-Owners can use this.', 
+                            ephemeral: true 
+                        });
+                    }
+
+                    // Create the embed and dropdown menu for POTW
+                    const embed = new EmbedBuilder()
+                        .setTitle('🌟 Photo of the Week (POTW) Voting!')
+                        .setDescription('Scroll up in this channel to view the 7 submitted images. Select your favorite photo from the dropdown menu below!\n\n*Your vote is completely hidden.*')
+                        .setColor('#FFD700')
+                        .setFooter({ text: 'Voting is now open!' });
+
+                    const row = new ActionRowBuilder().addComponents(
+                        new StringSelectMenuBuilder()
+                            .setCustomId('potw_vote_select')
+                            .setPlaceholder('Choose your favorite photo (1-7)...')
+                            .addOptions([
+                                { label: 'Photo 1', value: 'photo_1', emoji: '1️⃣' },
+                                { label: 'Photo 2', value: 'photo_2', emoji: '2️⃣' },
+                                { label: 'Photo 3', value: 'photo_3', emoji: '3️⃣' },
+                                { label: 'Photo 4', value: 'photo_4', emoji: '4️⃣' },
+                                { label: 'Photo 5', value: 'photo_5', emoji: '5️⃣' },
+                                { label: 'Photo 6', value: 'photo_6', emoji: '6️⃣' },
+                                { label: 'Photo 7', value: 'photo_7', emoji: '7️⃣' },
+                            ])
+                    );
+
+                    const message = await interaction.reply({ embeds: [embed], components: [row], fetchReply: true });
+                    
+                    // Initialize storage for this specific voting message
+                    activeVotes.set(message.id, {});
+                }
+            }
         }
+
+        // 2. Handle Button Interactions (Role Picker)
+        if (interaction.isButton()) {
+            const roleId = ROLE_MAP[interaction.customId];
+            if (!roleId) return;
+
+            const role = interaction.guild.roles.cache.get(roleId);
+            if (!role) {
+                return interaction.reply({ content: 'Role ID not found. Please check your config.', ephemeral: true });
+            }
+
+            const member = interaction.member;
+
+            if (member.roles.cache.has(roleId)) {
+                await member.roles.remove(roleId);
+                await interaction.reply({ content: `Removed **${role.name}** role!`, ephemeral: true });
+            } else {
+                await member.roles.add(roleId);
+                await interaction.reply({ content: `Granted **${role.name}** role! You can now send messages in your dedicated channel.`, ephemeral: true });
+            }
+        }
+
+        // 3. Handle Select Menu Interactions (POTW Voting)
+        if (interaction.isStringSelectMenu()) {
+            if (interaction.customId === 'potw_vote_select') {
+                const messageId = interaction.message.id;
+                const userId = interaction.user.id;
+                const choice = interaction.values[0];
+
+                if (!activeVotes.has(messageId)) {
+                    activeVotes.set(messageId, {});
+                }
+
+                const voteSession = activeVotes.get(messageId);
+
+                // Check if user already voted
+                if (voteSession[userId]) {
+                    return interaction.reply({ 
+                        content: '❌ You have already cast your vote for this session! Votes cannot be changed.', 
+                        ephemeral: true 
+                    });
+                }
+
+                // Save the vote
+                voteSession[userId] = choice;
+
+                return interaction.reply({ 
+                    content: `✅ Your vote for **${choice.replace('_', ' ').toUpperCase()}** has been successfully recorded securely!`, 
+                    ephemeral: true 
+                });
+            }
+        }
+
     } catch (err) {
         console.error(err);
-        await interaction.reply({ content: 'Could not update role. Ensure my Bot Role is higher than the roles it assigns!', ephemeral: true });
+        if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ content: 'Could not process action. Ensure my Bot Role is higher than the roles it assigns!', ephemeral: true }).catch(() => {});
+        }
     }
 });
 
