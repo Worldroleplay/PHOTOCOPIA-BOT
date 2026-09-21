@@ -34,7 +34,7 @@ const activeVotes = new Map();
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
 
-    // Register the /vote command globally
+    // Register slash commands globally (/vote and /endvote)
     const commands = [
         new SlashCommandBuilder()
             .setName('vote')
@@ -46,6 +46,14 @@ client.once('ready', async () => {
                     .addChoices(
                         { name: 'POTW', value: 'POTW' }
                     )
+            ),
+        new SlashCommandBuilder()
+            .setName('endvote')
+            .setDescription('End the POTW vote and publish the winner to announcements')
+            .addChannelOption(option =>
+                option.setName('channel')
+                    .setDescription('The announcements channel to post the winner')
+                    .setRequired(true)
             )
     ];
 
@@ -109,19 +117,19 @@ const ROLE_MAP = {
 
 client.on('interactionCreate', async (interaction) => {
     try {
-        // 1. Handle Slash Commands (e.g., /vote POTW)
+        // Helper role checks for leadership
+        const allowedRoles = ['founder', 'owner', 'co-owner'];
+        const hasAllowedRole = interaction.member.roles.cache.some(role => 
+            allowedRoles.some(name => role.name.toLowerCase().includes(name))
+        );
+        const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+        // 1. Handle Slash Commands (/vote and /endvote)
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === 'vote') {
                 const voteType = interaction.options.getString('type');
 
                 if (voteType === 'POTW') {
-                    // Check if user has Founder, Owner, Co-Owner or Admin permissions
-                    const allowedRoles = ['founder', 'owner', 'co-owner'];
-                    const hasAllowedRole = interaction.member.roles.cache.some(role => 
-                        allowedRoles.some(name => role.name.toLowerCase().includes(name))
-                    );
-                    const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
-
                     if (!hasAllowedRole && !isAdmin) {
                         return interaction.reply({ 
                             content: '❌ You do not have permission to start a POTW vote! Only Founders, Owners, and Co-Owners can use this.', 
@@ -129,7 +137,6 @@ client.on('interactionCreate', async (interaction) => {
                         });
                     }
 
-                    // Create the embed and dropdown menu for POTW
                     const embed = new EmbedBuilder()
                         .setTitle('🌟 Photo of the Week (POTW) Voting!')
                         .setDescription('Scroll up in this channel to view the 7 submitted images. Select your favorite photo from the dropdown menu below!\n\n*Your vote is completely hidden.*')
@@ -152,10 +159,51 @@ client.on('interactionCreate', async (interaction) => {
                     );
 
                     const message = await interaction.reply({ embeds: [embed], components: [row], fetchReply: true });
-                    
-                    // Initialize storage for this specific voting message
                     activeVotes.set(message.id, {});
                 }
+            } 
+            else if (interaction.commandName === 'endvote') {
+                if (!hasAllowedRole && !isAdmin) {
+                    return interaction.reply({ 
+                        content: '❌ You do not have permission to end a POTW vote!', 
+                        ephemeral: true 
+                    });
+                }
+
+                if (activeVotes.size === 0) {
+                    return interaction.reply({ content: '❌ There are no active voting sessions running right now.', ephemeral: true });
+                }
+
+                const [messageId, votes] = Array.from(activeVotes.entries()).pop();
+                const targetChannel = interaction.options.getChannel('channel');
+
+                const tally = {};
+                Object.values(votes).forEach(choice => {
+                    tally[choice] = (tally[choice] || 0) + 1;
+                });
+
+                let winner = 'No votes cast';
+                let maxVotes = 0;
+                for (const [photo, count] of Object.entries(tally)) {
+                    if (count > maxVotes) {
+                        maxVotes = count;
+                        winner = photo;
+                    }
+                }
+
+                const winnerFormatted = winner !== 'No votes cast' ? winner.replace('_', ' ').toUpperCase() : 'No Winner';
+
+                const winnerEmbed = new EmbedBuilder()
+                    .setTitle('🏆 Photo of the Week (POTW) Winner!')
+                    .setDescription(`Voting has officially closed! The community has spoken, and the winner is **${winnerFormatted}** with a total of **${maxVotes}** secure votes! 🎉\n\nCheck out `#photo-of-the-week` to view the winning shot.`)
+                    .setColor('#00FF00')
+                    .setTimestamp();
+
+                await targetChannel.send({ embeds: [winnerEmbed] });
+
+                activeVotes.delete(messageId);
+
+                await interaction.reply({ content: `✅ Voting ended successfully! Results have been posted to ${targetChannel}.`, ephemeral: true });
             }
         }
 
@@ -193,7 +241,6 @@ client.on('interactionCreate', async (interaction) => {
 
                 const voteSession = activeVotes.get(messageId);
 
-                // Check if user already voted
                 if (voteSession[userId]) {
                     return interaction.reply({ 
                         content: '❌ You have already cast your vote for this session! Votes cannot be changed.', 
@@ -201,7 +248,6 @@ client.on('interactionCreate', async (interaction) => {
                     });
                 }
 
-                // Save the vote
                 voteSession[userId] = choice;
 
                 return interaction.reply({ 
