@@ -10,6 +10,9 @@ const {
     Routes,
     SlashCommandBuilder,
     StringSelectMenuBuilder,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle,
     PermissionsBitField
 } = require('discord.js');
 
@@ -34,7 +37,7 @@ const activeVotes = new Map();
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
 
-    // Register slash commands globally (/vote and /endvote)
+    // Register slash commands globally (/vote, /endvote, and /gear showcase)
     const commands = [
         new SlashCommandBuilder()
             .setName('vote')
@@ -54,6 +57,23 @@ client.once('ready', async () => {
                 option.setName('channel')
                     .setDescription('The announcements channel to post the winner')
                     .setRequired(true)
+            ),
+        new SlashCommandBuilder()
+            .setName('gear')
+            .setDescription('Manage your photography gear')
+            .addSubcommand(subcommand =>
+                subcommand
+                    .setName('showcase')
+                    .setDescription('Showcase your camera or mobile gear profile')
+                    .addStringOption(option =>
+                        option.setName('type')
+                            .setDescription('Are you sharing a camera or mobile setup?')
+                            .setRequired(true)
+                            .addChoices(
+                                { name: 'Camera & Lens', value: 'gear_camera' },
+                                { name: 'Mobile Shooter', value: 'gear_mobile' }
+                            )
+                    )
             )
     ];
 
@@ -124,7 +144,7 @@ client.on('interactionCreate', async (interaction) => {
         );
         const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
 
-        // 1. Handle Slash Commands (/vote and /endvote)
+        // 1. Handle Slash Commands
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === 'vote') {
                 const voteType = interaction.options.getString('type');
@@ -200,10 +220,61 @@ client.on('interactionCreate', async (interaction) => {
                     .setTimestamp();
 
                 await targetChannel.send({ embeds: [winnerEmbed] });
-
                 activeVotes.delete(messageId);
 
                 await interaction.reply({ content: `✅ Voting ended successfully! Results have been posted to ${targetChannel}.`, ephemeral: true });
+            }
+            else if (interaction.commandName === 'gear') {
+                const subcommand = interaction.options.getSubcommand();
+                
+                if (subcommand === 'showcase') {
+                    const gearType = interaction.options.getString('type');
+
+                    if (gearType === 'gear_camera') {
+                        const modal = new ModalBuilder()
+                            .setCustomId('modal_gear_camera')
+                            .setTitle('📷 Camera & Lens Setup');
+
+                        const bodyInput = new TextInputBuilder()
+                            .setCustomId('input_camera_body')
+                            .setLabel('Camera Body & Brand')
+                            .setPlaceholder('e.g., Sony A7IV, Fujifilm X-T5')
+                            .setStyle(TextInputStyle.Short)
+                            .setRequired(true);
+
+                        const lensInput = new TextInputBuilder()
+                            .setCustomId('input_camera_lens')
+                            .setLabel('Favorite Lens / Focal Length')
+                            .setPlaceholder('e.g., 35mm f/1.8, 24-70mm zoom')
+                            .setStyle(TextInputStyle.Short)
+                            .setRequired(true);
+
+                        modal.addComponents(new ActionRowBuilder().addComponents(bodyInput), new ActionRowBuilder().addComponents(lensInput));
+                        return await interaction.showModal(modal);
+                    } 
+                    else if (gearType === 'gear_mobile') {
+                        const modal = new ModalBuilder()
+                            .setCustomId('modal_gear_mobile')
+                            .setTitle('📱 Mobile Shooter Setup');
+
+                        const phoneInput = new TextInputBuilder()
+                            .setCustomId('input_phone_model')
+                            .setLabel('Phone Model')
+                            .setPlaceholder('e.g., iPhone 15 Pro, Pixel 8 Pro')
+                            .setStyle(TextInputStyle.Short)
+                            .setRequired(true);
+
+                        const specsInput = new TextInputBuilder()
+                            .setCustomId('input_phone_specs')
+                            .setLabel('Megapixels & Special Specs')
+                            .setPlaceholder('e.g., 48MP main, ProRAW, Moment Macro Lens')
+                            .setStyle(TextInputStyle.Paragraph)
+                            .setRequired(true);
+
+                        modal.addComponents(new ActionRowBuilder().addComponents(phoneInput), new ActionRowBuilder().addComponents(specsInput));
+                        return await interaction.showModal(modal);
+                    }
+                }
             }
         }
 
@@ -254,6 +325,45 @@ client.on('interactionCreate', async (interaction) => {
                     content: `✅ Your vote for **${choice.replace('_', ' ').toUpperCase()}** has been successfully recorded securely!`, 
                     ephemeral: true 
                 });
+            }
+        }
+
+        // 4. Handle Modal Submissions (Posts the Gear Card)
+        if (interaction.isModalSubmit()) {
+            if (interaction.customId === 'modal_gear_camera') {
+                const body = interaction.fields.getTextInputValue('input_camera_body');
+                const lens = interaction.fields.getTextInputValue('input_camera_lens');
+
+                const gearEmbed = new EmbedBuilder()
+                    .setTitle(`📷 Camera Rig: ${interaction.user.username}`)
+                    .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true }))
+                    .addFields(
+                        { name: 'Camera Body', value: body, inline: true },
+                        { name: 'Favorite Lens / Focal Length', value: lens, inline: true }
+                    )
+                    .setColor(0x3498db)
+                    .setTimestamp();
+
+                await interaction.reply({ content: '✅ Your camera gear profile has been posted!', ephemeral: true });
+                return await interaction.channel.send({ embeds: [gearEmbed] });
+            } 
+            
+            else if (interaction.customId === 'modal_gear_mobile') {
+                const phone = interaction.fields.getTextInputValue('input_phone_model');
+                const specs = interaction.fields.getTextInputValue('input_phone_specs');
+
+                const gearEmbed = new EmbedBuilder()
+                    .setTitle(`📱 Mobile Rig: ${interaction.user.username}`)
+                    .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true }))
+                    .addFields(
+                        { name: 'Phone Model', value: phone, inline: false },
+                        { name: 'Specs & Special Setup', value: specs, inline: false }
+                    )
+                    .setColor(0x2ecc71)
+                    .setTimestamp();
+
+                await interaction.reply({ content: '✅ Your mobile gear profile has been posted!', ephemeral: true });
+                return await interaction.channel.send({ embeds: [gearEmbed] });
             }
         }
 
