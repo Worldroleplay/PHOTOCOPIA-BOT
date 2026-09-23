@@ -18,6 +18,7 @@ const {
 
 // Dummy HTTP server to keep Render Web Service active
 http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.write("PHOTOCOPIA BOT is running!");
     res.end();
 }).listen(process.env.PORT || 3000);
@@ -178,8 +179,8 @@ client.on('interactionCreate', async (interaction) => {
                             ])
                     );
 
-                    const message = await interaction.reply({ embeds: [embed], components: [row], fetchReply: true });
-                    activeVotes.set(message.id, {});
+                    const sentMessage = await interaction.reply({ embeds: [embed], components: [row], fetchReply: true });
+                    activeVotes.set(sentMessage.id, {});
                 }
             } 
             else if (interaction.commandName === 'endvote') {
@@ -347,7 +348,6 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.reply({ content: '✅ Your camera gear profile has been posted!', ephemeral: true });
                 return await interaction.channel.send({ embeds: [gearEmbed] });
             } 
-            
             else if (interaction.customId === 'modal_gear_mobile') {
                 const phone = interaction.fields.getTextInputValue('input_phone_model');
                 const specs = interaction.fields.getTextInputValue('input_phone_specs');
