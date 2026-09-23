@@ -284,19 +284,22 @@ client.on('interactionCreate', async (interaction) => {
             const roleId = ROLE_MAP[interaction.customId];
             if (!roleId) return;
 
+            // Acknowledge interaction instantly to prevent timeouts
+            await interaction.deferReply({ ephemeral: true });
+
             const role = interaction.guild.roles.cache.get(roleId);
             if (!role) {
-                return interaction.reply({ content: 'Role ID not found. Please check your config.', ephemeral: true });
+                return interaction.editReply({ content: 'Role ID not found. Please check your config.' });
             }
 
             const member = interaction.member;
 
             if (member.roles.cache.has(roleId)) {
                 await member.roles.remove(roleId);
-                await interaction.reply({ content: `Removed **${role.name}** role!`, ephemeral: true });
+                await interaction.editReply({ content: `Removed **${role.name}** role!` });
             } else {
                 await member.roles.add(roleId);
-                await interaction.reply({ content: `Granted **${role.name}** role! You can now send messages in your dedicated channel.`, ephemeral: true });
+                await interaction.editReply({ content: `Granted **${role.name}** role! You can now send messages in your dedicated channel.` });
             }
         }
 
